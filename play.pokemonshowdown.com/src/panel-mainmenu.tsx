@@ -21,6 +21,8 @@ import { Dex, TL, toID, type ID } from "./battle-dex";
 import type { Args } from "./battle-text-parser";
 import { BattleLog } from "./battle-log"; // optional
 
+const CLASH_DRAFT_FORMAT ='gen9championsvgcclashdraft';
+
 export type RoomInfo = {
 	title: string, id?: RoomID, desc?: string, userCount?: number, section?: string, privacy?: 'hidden',
 	spotlight?: string, subRooms?: string[],
@@ -54,6 +56,8 @@ export class MainMenuRoom extends PSRoom {
 	search: { searching: string[], games: Record<RoomID, string> | null } = { searching: [], games: null };
 	disallowSpectators: boolean | null = PS.prefs.disallowspectators;
 	lastChallenged: number | null = null;
+	draftChallengeOutgoing: string | null = null;
+	draftSearching = false;
 	constructor(options: RoomOptions) {
 		super(options);
 		if (this.backlog) {
@@ -89,6 +93,10 @@ export class MainMenuRoom extends PSRoom {
 		this.update(null);
 	};
 	searchingFormat() {
+		if (this.draftSearching) {
+			return CLASH_DRAFT_FORMAT;
+		}
+
 		return this.searchCountdown?.format || this.teamSent ||
 			this.search.searching?.[this.search.searching.length - 1] || null;
 	}
@@ -96,6 +104,12 @@ export class MainMenuRoom extends PSRoom {
 		if (this.searchCountdown) {
 			clearTimeout(this.searchCountdown.timer);
 			this.searchCountdown = null;
+			this.update(null);
+			return true;
+		}
+		if (this.draftSearching) {
+			this.draftSearching = false;
+			PS.send('/draftcancelsearch');
 			this.update(null);
 			return true;
 		}
@@ -120,6 +134,12 @@ export class MainMenuRoom extends PSRoom {
 	};
 	doSearch = (search: NonNullable<typeof this.searchCountdown>) => {
 		this.teamSent = search.format;
+
+		if (toID(search.format) === CLASH_DRAFT_FORMAT) {
+			PS.send('/draftsearch');
+			return;
+		}
+
 		const privacy = this.adjustPrivacy();
 		PS.send(`/utm ${search.packedTeam}`);
 		PS.send(`${privacy}/search ${search.format}`);
@@ -130,20 +150,37 @@ export class MainMenuRoom extends PSRoom {
 		case 'challstr': {
 			const [, challstr] = args;
 			PS.user.challstr = challstr;
-			PSLoginServer.query(
-				'upkeep', { challstr }
-			).then(res => {
-				if (!res?.username) {
-					PS.user.initializing = false;
-					return;
-				}
-				// | , ; are not valid characters in names
-				res.username = res.username.replace(/[|,;]+/g, '');
-				if (res.loggedin) {
-					PS.user.registered = { name: res.username, userid: toID(res.username) };
-				}
-				PS.user.handleAssertion(res.username, res.assertion);
-			});
+
+			let savedName: string | null = null;
+			let lastSeen = 0;
+
+			try {
+				savedName = localStorage.getItem('clashdraft_username');
+				lastSeen = Number(
+					localStorage.getItem('clashdraft_last_seen') || 0
+				);
+			} catch {}
+
+			const RECONNECT_TIME = 10 * 60 * 1000;
+			const canReconnect =
+				!!savedName &&
+				!!lastSeen &&
+				Date.now() - lastSeen <= RECONNECT_TIME;
+
+			if (canReconnect) {
+				// Automatically reclaim our temporary username.
+				PS.send(`/trn ${savedName}`);
+			} else {
+				// Previous temporary session has expired.
+				try {
+					localStorage.removeItem('clashdraft_username');
+					localStorage.removeItem('clashdraft_last_seen');
+				} catch {}
+
+				PS.user.initializing = false;
+				PS.user.update(null);
+			}
+
 			return;
 		} case 'updateuser': {
 			const [, fullName, namedCode, avatar, settingsJSON] = args;
@@ -157,6 +194,17 @@ export class MainMenuRoom extends PSRoom {
 			}
 			void Dex.loadTextData().then(() => PS.updateTranslatedText());
 			PS.user.setName(fullName, named, avatar);
+
+			if (named) {
+				try {
+					localStorage.setItem('clashdraft_username', PS.user.name);
+					localStorage.setItem(
+						'clashdraft_last_seen',
+						Date.now().toString()
+					);
+				} catch {}
+			}
+
 			PS.teams.loadRemoteTeams();
 			return;
 		} case 'updatechallenges': {
@@ -200,6 +248,64 @@ export class MainMenuRoom extends PSRoom {
 				width = 960;
 			}
 			PS.alert(message.replace(/\|\|/g, '\n'), { width });
+			return;
+		}case 'draftchallenge': {
+			const challenger = args[1];
+
+			void PS.confirm(
+				`${challenger} challenged you to a VGC Clash Draft.`,
+				{
+					okButton: 'Accept',
+				}
+			).then(accepted => {
+				if (accepted) {
+					PS.send(`/draftaccept ${challenger}`);
+				} else {
+					PS.send(`/draftreject ${challenger}`);
+				}
+			});
+
+			return;
+		}case 'draftchallengesent': {
+			this.draftChallengeOutgoing = args[1];
+			this.update(null);
+			return;
+		}case 'draftchallengeaccepted': {
+			this.draftChallengeOutgoing = null;
+			this.update(null);
+			return;
+		}case 'draftchallengerejected': {
+			const opponent = args[1];
+
+			this.draftChallengeOutgoing = null;
+			this.update(null);
+
+			PS.alert(
+				`${opponent} rejected your Clash Draft challenge.`
+			);
+
+			return;
+		}case 'draftchallengecancelled': {
+			const challenger = args[1];
+
+			PS.alert(
+				`${challenger} cancelled their Clash Draft challenge.`
+			);
+
+			return;
+		}case 'draftchallengecleared': {
+			this.draftChallengeOutgoing = null;
+			this.update(null);
+			return;
+		}case 'draftsearch': {
+
+			this.teamSent = null;
+
+			this.draftSearching =
+				args[1] === '1';
+
+			this.update(null);
+
 			return;
 		}
 		}
@@ -514,50 +620,19 @@ class NewsPanel extends PSRoomPanel {
 	static readonly routes = ['news'];
 	static readonly title = 'News';
 	static readonly location = 'mini-window';
+
 	static getTitle() {
 		return TL`News`;
 	}
-	change = (ev: Event) => {
-		const target = ev.currentTarget as HTMLInputElement;
-		this.setClient(target.value as '0' | '1' | 'leave');
-	};
-	setClient(setting: '0' | '1' | 'leave') {
-		if (setting === '1') {
-			document.cookie = "preactalpha=1; expires=Thu, 1 Dec 2026 12:00:00 UTC; path=/";
-		} else if (setting === '0') {
-			document.cookie = "preactalpha=0; expires=Thu, 1 Dec 2026 12:00:00 UTC; path=/";
-		} else {
-			document.cookie = "preactalpha=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
-		}
-		if (setting === 'leave') {
-			document.location.href = `/`;
-		}
-	}
-	override componentDidMount() {
-		if (!document.cookie.includes('preactalpha=')) this.setClient('1');
-	}
+
 	override render() {
-		const cookieSet = !document.cookie.includes('preactalpha=0');
 		return <PSPanelWrapper room={this.props.room} fullSize>
-			<div class="construction">
-				This is the client rewrite beta test.
-				<form>
-					<label class="checkbox">
-						<input type="radio" name="preactalpha" value="1" onChange={this.change} checked={cookieSet} /> {}
-						Use Rewrite always
-					</label>
-					<label class="checkbox">
-						<input type="radio" name="preactalpha" value="0" onChange={this.change} checked={!cookieSet} /> {}
-						Use Rewrite with URL
-					</label>
-					<label class="checkbox">
-						<input type="radio" name="preactalpha" value="leave" onChange={this.change} /> {}
-						Back to the old client
-					</label>
-				</form>
-				Provide feedback in <a href="development" style="color:black">the Dev chatroom</a>.
-			</div>
-			<div class="readable-bg" dangerouslySetInnerHTML={{ __html: PS.newsHTML }}></div>
+			<div
+				class="readable-bg"
+				dangerouslySetInnerHTML={{
+					__html: PS.newsHTML,
+				}}
+			/>
 		</PSPanelWrapper>;
 	}
 }
@@ -688,7 +763,7 @@ class MainMenuPanel extends PSRoomPanel<MainMenuRoom> {
 		}
 
 		if (!PS.user.userid || PS.isOffline) {
-			return <TeamForm class="menugroup" onSubmit={this.submitSearch} selectType="search">
+			return <TeamForm class="menugroup" defaultFormat={CLASH_DRAFT_FORMAT} onSubmit={this.submitSearch} selectType="search">
 				<button class="mainmenu1 mainmenu big button disabled" disabled name="search">
 					<em>{PS.isOffline ? [<span class="fa-stack fa-lg">
 						<i class="fa fa-plug fa-flip-horizontal fa-stack-1x" aria-hidden></i>
@@ -705,7 +780,7 @@ class MainMenuPanel extends PSRoomPanel<MainMenuRoom> {
 		}
 
 		return <TeamForm
-			class="menugroup" format={PS.mainmenu.searchingFormat() || undefined}
+			class="menugroup" format={PS.mainmenu.searchingFormat() || undefined} defaultFormat={CLASH_DRAFT_FORMAT}
 			selectType="search" onSubmit={this.submitSearch}
 		>
 			<p>
@@ -745,6 +820,103 @@ class MainMenuPanel extends PSRoomPanel<MainMenuRoom> {
 			</small>
 		);
 	}
+	submitDraftChallenge = (ev: Event) => {
+		ev.preventDefault();
+
+		const form = ev.currentTarget as HTMLFormElement;
+
+		const input = form.elements.namedItem(
+			'draftchallengeuser'
+		) as HTMLInputElement | null;
+
+		if (!input) return;
+
+		const name = input.value.trim();
+
+		if (!name) {
+			PS.alert(
+				`Enter the username of the player you want to challenge.`,
+				{parentElem: input}
+			);
+			return;
+		}
+
+		if (!PS.user.named) {
+			PS.join('login' as RoomID, {
+				parentElem: input,
+			});
+			return;
+		}
+
+		if (toID(name) === PS.user.userid) {
+			PS.alert(
+				`You cannot challenge yourself.`,
+				{parentElem: input}
+			);
+			return;
+		}
+
+		PS.send(
+			`/draftchallenge ${name}`
+		);
+	};
+	renderDraftChallengeBox() {
+		const outgoing =
+			this.props.room.draftChallengeOutgoing;
+
+		const disabled =
+			PS.isOffline || !PS.user.userid;
+
+		return <div class="menugroup clash-draft-challenge-menu">
+
+			<div class="clash-draft-challenge-title">
+				VGC Clash Draft
+			</div>
+
+			{outgoing ? <>
+
+				<p class="clash-draft-challenge-waiting">
+					Waiting for <strong>{outgoing}</strong>...
+				</p>
+
+				<button
+					class="button"
+					data-cmd="/draftcancel"
+				>
+					Cancel Challenge
+				</button>
+
+			</> :
+
+				<form onSubmit={this.submitDraftChallenge}>
+
+					<p class="clash-draft-challenge-description">
+						Challenge another player directly
+					</p>
+
+					<input
+						class="textbox clash-draft-challenge-input"
+						name="draftchallengeuser"
+						type="text"
+						placeholder="Opponent username"
+						autocomplete="off"
+						disabled={disabled}
+					/>
+
+					<button
+						class="button clash-draft-challenge-button"
+						type="submit"
+						disabled={disabled}
+					>
+						<strong>Challenge</strong>
+					</button>
+
+				</form>
+
+			}
+
+		</div>;
+	}
 	override render() {
 		const onlineButton = ' button' + (PS.isOffline ? ' disabled' : '');
 		const tinyLayout = this.props.room.width < 620 ? ' tiny-layout' : '';
@@ -760,6 +932,8 @@ class MainMenuPanel extends PSRoomPanel<MainMenuRoom> {
 					{this.renderGames()}
 
 					{this.renderSearchButton()}
+
+					{this.renderDraftChallengeBox()}
 
 					<div class="menugroup">
 						<p><a class="mainmenu2 mainmenu button" href="teambuilder">{TL`Teambuilder`}</a></p>
@@ -1117,5 +1291,17 @@ export class TeamForm extends preact.Component<{
 		</form>;
 	}
 }
+
+window.addEventListener('pagehide', () => {
+	if (!PS.user.named) return;
+
+	try {
+		localStorage.setItem('clashdraft_username', PS.user.name);
+		localStorage.setItem(
+			'clashdraft_last_seen',
+			Date.now().toString()
+		);
+	} catch {}
+});
 
 PS.addRoomType(NewsPanel, MainMenuPanel);

@@ -698,24 +698,18 @@ class PSUser extends PSStreamModel<PSLoginState | null> {
 	changeName(name: string) {
 		name = this.validateName(name);
 		const userid = toID(name);
+
 		if (!userid) {
-			this.updateLogin({ name, error: "Usernames must contain at least one letter." });
+			this.updateLogin({
+				name,
+				error: "Usernames must contain at least one letter.",
+			});
 			return;
 		}
 
-		if (userid === this.userid) {
-			PS.send(`/trn ${name}`);
-			this.update({ success: true });
-			return;
-		}
-		this.loggingIn = name;
-		this.update(null);
-		PSLoginServer.rawQuery(
-			'getassertion', { userid, challstr: this.challstr }
-		).then(res => {
-			this.handleAssertion(name, res);
-			this.updateRegExp();
-		});
+		// Clash Draft uses temporary usernames with no password/auth server.
+		PS.send(`/trn ${name}`);
+		this.update({success: true});
 	}
 	changeNameWithPassword(name: string, password: string, special: PSLoginState = { needsPassword: true }) {
 		this.loggingIn = name;
@@ -2083,7 +2077,7 @@ export const PS = new class extends PSModel {
 			title: "Rooms",
 			autofocus: false,
 		});
-		this.rightPanel = this.rooms['rooms']!;
+		this.rightPanel = null;
 
 		if (this.newsHTML) {
 			this.addRoom({
@@ -2286,7 +2280,10 @@ export const PS = new class extends PSModel {
 						id: roomid2,
 						type,
 						connected: 'init',
-						autofocus: roomid !== 'staff' && roomid !== 'upperstaff',
+						autofocus:
+							roomid2 !== 'lobby' &&
+							roomid !== 'staff' &&
+							roomid !== 'upperstaff',
 						// probably the only use for `autoclosePopups: false`.
 						// (the server sometimes sends a popup error message and a new room at the same time)
 						autoclosePopups: false,
@@ -2410,6 +2407,12 @@ export const PS = new class extends PSModel {
 	 * @see {@link leftPanelWidth} for return value meaning
 	 */
 	calculateLeftPanelWidth() {
+
+		// Clash Draft should occupy the whole client while focused.
+		if (this.panel?.type === 'clashdraft') {
+			return 0;
+		}
+
 		if (this.prefs.onepanel === 'vertical') return null;
 		if (!this.prefs.onepanel && document.documentElement.clientWidth < 700) return null;
 		if (!this.prefs.onepanel && document.documentElement.clientHeight < 430) return null;
